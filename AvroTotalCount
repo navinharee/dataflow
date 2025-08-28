@@ -1,0 +1,98 @@
+package your.pkg;
+
+import java.io.InputStream;
+import java.nio.channels.Channels;
+import java.time.Instant;
+import javax.annotation.Nullable;
+
+import org.apache.avro.file.DataFileStream;
+import org.apache.avro.generic.GenericDatumReader;
+import org.apache.avro.generic.GenericRecord;
+
+import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.io.FileIO;
+import org.apache.beam.sdk.io.TextIO;
+import org.apache.beam.sdk.options.PipelineOptions;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.MapElements;
+import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.Sum;
+import org.apache.beam.sdk.values.TypeDescriptors;
+
+/**
+ * Counts Avro records by summing per-block counts (fast; no per-record deserialization).
+ * Designed to be called from an existing main/switch.
+ */
+public final class AvroTotalCount {
+
+  private AvroTotalCount() {}
+
+  /** Delegate entry point you can call from your main pipeline. */
+  public static void countAvro(
+      PipelineOptions opts,
+      String inputGlob,
+      @Nullable Long expectedCount,
+      @Nullable String outputPrefix) {
+
+    Pipeline p = Pipeline.create(opts);
+
+    // 1) Expand and read files in parallel.
+    var files = p.apply("MatchFiles", FileIO.match().filepattern(inputGlob))
+                 .apply("ReadMatches", FileIO.readMatches());
+
+    // 2) For each file, sum the Avro block header record counts.
+    var perFileCounts = files.apply("CountBlocksPerFile", ParDo.of(new CountBlocksFn()));
+
+    // 3) Global sum across all files.
+    var total = perFileCounts.apply("SumAllFiles", Sum.longsGlobally());
+
+    // 4) Fail the job if the expectedCount is provided and doesn't match.
+    total.apply("ValidateTotal", ParDo.of(new ValidateTotalFn(expectedCount)));
+
+    // 5) Optionally write a single-line JSON summary.
+    if (outputPrefix != null && !outputPrefix.isEmpty()) {
+      var line = total.apply("FormatJSON", MapElements.into(TypeDescriptors.strings())
+          .via(cnt -> String.format(
+              "{\"timestamp\":\"%s\",\"input\":\"%s\",\"total\":%d,%s}",
+              Instant.now().toString(),
+              inputGlob,
+              cnt,
+              expectedCount == null ? "\"expected\":null" : "\"expected\":" + expectedCount
+          )));
+      line.apply("WriteSummary", TextIO.write().to(outputPrefix).withoutSharding());
+    }
+
+    p.run();
+  }
+
+  /** Sums block counts for one Avro container file. */
+  static class CountBlocksFn extends DoFn<FileIO.ReadableFile, Long> {
+    @ProcessElement
+    public void process(@Element FileIO.ReadableFile f, OutputReceiver<Long> out) throws Exception {
+      long total = 0L;
+      try (InputStream in = Channels.newInputStream(f.open());
+           DataFileStream<GenericRecord> dfs =
+               new DataFileStream<>(in, new GenericDatumReader<>())) {
+        while (dfs.hasNextBlock()) {
+          dfs.nextBlock();
+          total += dfs.getBlockCount();   // <- fast: read count from block header
+        }
+      }
+      out.output(total);
+    }
+  }
+
+  /** Throws to fail the pipeline when actual != expected (if expected provided). */
+  static class ValidateTotalFn extends DoFn<Long, Void> {
+    private final @Nullable Long expected;
+    ValidateTotalFn(@Nullable Long expected) { this.expected = expected; }
+
+    @ProcessElement
+    public void process(@Element Long actual) {
+      if (expected != null && !expected.equals(actual)) {
+        throw new RuntimeException(
+            "AvroTotalCount mismatch: actual=" + actual + " expected=" + expected);
+      }
+    }
+  }
+}
