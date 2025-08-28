@@ -1,11 +1,15 @@
-package your.pkg;
+package com.db.palaceacc.irds.pipeline;
 
-import java.io.InputStream;
-import java.nio.channels.Channels;
+import java.io.IOException;
 import java.time.Instant;
+import java.util.Objects;
+import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
+
 import javax.annotation.Nullable;
 
-import org.apache.avro.file.DataFileStream;
+import org.apache.avro.file.DataFileReader;
+import org.apache.avro.file.SeekableInput;
 import org.apache.avro.generic.GenericDatumReader;
 import org.apache.avro.generic.GenericRecord;
 
@@ -20,36 +24,47 @@ import org.apache.beam.sdk.transforms.Sum;
 import org.apache.beam.sdk.values.TypeDescriptors;
 
 /**
- * Counts Avro records by summing per-block counts (fast; no per-record deserialization).
+ * Fast total-record counter for Avro container files.
+ * Counts by summing per-block header counts (no per-record deserialization).
  * Designed to be called from an existing main/switch.
  */
 public final class AvroTotalCount {
 
   private AvroTotalCount() {}
 
-  /** Delegate entry point you can call from your main pipeline. */
+  /**
+   * Entry point to invoke from your main pipeline switch.
+   *
+   * @param opts           existing PipelineOptions (passed through)
+   * @param inputGlob      e.g. "gs://bucket/path/**/*.avro"
+   * @param expectedCount  if non-null, the job fails when actual != expected
+   * @param outputPrefix   if non-null/non-empty, writes a single JSON line summary
+   */
   public static void countAvro(
       PipelineOptions opts,
       String inputGlob,
       @Nullable Long expectedCount,
       @Nullable String outputPrefix) {
 
+    Objects.requireNonNull(opts, "opts");
+    Objects.requireNonNull(inputGlob, "inputGlob");
+
     Pipeline p = Pipeline.create(opts);
 
-    // 1) Expand and read files in parallel.
+    // 1) Expand files (parallel over ~thousands of files).
     var files = p.apply("MatchFiles", FileIO.match().filepattern(inputGlob))
                  .apply("ReadMatches", FileIO.readMatches());
 
-    // 2) For each file, sum the Avro block header record counts.
+    // 2) Per-file count using Avro block headers (no record decode).
     var perFileCounts = files.apply("CountBlocksPerFile", ParDo.of(new CountBlocksFn()));
 
-    // 3) Global sum across all files.
+    // 3) Global sum.
     var total = perFileCounts.apply("SumAllFiles", Sum.longsGlobally());
 
-    // 4) Fail the job if the expectedCount is provided and doesn't match.
+    // 4) Validate vs expected (if provided).
     total.apply("ValidateTotal", ParDo.of(new ValidateTotalFn(expectedCount)));
 
-    // 5) Optionally write a single-line JSON summary.
+    // 5) Optional: write one-line JSON summary.
     if (outputPrefix != null && !outputPrefix.isEmpty()) {
       var line = total.apply("FormatJSON", MapElements.into(TypeDescriptors.strings())
           .via(cnt -> String.format(
@@ -65,25 +80,35 @@ public final class AvroTotalCount {
     p.run();
   }
 
-  /** Sums block counts for one Avro container file. */
-  static class CountBlocksFn extends DoFn<FileIO.ReadableFile, Long> {
+  /**
+   * DoFn: sums Avro block counts for a single Avro data file using DataFileReader.
+   * Uses a seekable channel (public hasNextBlock/nextBlock/getBlockCount API).
+   */
+  static final class CountBlocksFn extends DoFn<FileIO.ReadableFile, Long> {
     @ProcessElement
     public void process(@Element FileIO.ReadableFile f, OutputReceiver<Long> out) throws Exception {
       long total = 0L;
-      try (InputStream in = Channels.newInputStream(f.open());
-           DataFileStream<GenericRecord> dfs =
-               new DataFileStream<>(in, new GenericDatumReader<>())) {
-        while (dfs.hasNextBlock()) {
-          dfs.nextBlock();
-          total += dfs.getBlockCount();   // <- fast: read count from block header
+
+      try (SeekableByteChannel seekable = f.openSeekable();
+           DataFileReader<GenericRecord> reader = new DataFileReader<>(
+               new AvroSeekableInput(seekable), new GenericDatumReader<>())) {
+
+        while (reader.hasNextBlock()) {
+          reader.nextBlock();               // advance to next block
+          total += reader.getBlockCount();  // exact record count in this block
         }
+      } catch (Exception e) {
+        throw new RuntimeException("Failed scanning Avro file: " + f.getMetadata().resourceId(), e);
       }
+
       out.output(total);
     }
   }
 
-  /** Throws to fail the pipeline when actual != expected (if expected provided). */
-  static class ValidateTotalFn extends DoFn<Long, Void> {
+  /**
+   * DoFn: throws if actual != expected (when expected provided) to fail the job.
+   */
+  static final class ValidateTotalFn extends DoFn<Long, Void> {
     private final @Nullable Long expected;
     ValidateTotalFn(@Nullable Long expected) { this.expected = expected; }
 
@@ -94,5 +119,22 @@ public final class AvroTotalCount {
             "AvroTotalCount mismatch: actual=" + actual + " expected=" + expected);
       }
     }
+  }
+
+  /**
+   * Minimal adapter: Beam's SeekableByteChannel -> Avro's SeekableInput.
+   */
+  static final class AvroSeekableInput implements SeekableInput {
+    private final SeekableByteChannel ch;
+
+    AvroSeekableInput(SeekableByteChannel ch) { this.ch = ch; }
+
+    @Override public void seek(long p) throws IOException { ch.position(p); }
+    @Override public long tell() throws IOException { return ch.position(); }
+    @Override public long length() throws IOException { return ch.size(); }
+    @Override public int read(byte[] b, int off, int len) throws IOException {
+      return ch.read(ByteBuffer.wrap(b, off, len));
+    }
+    @Override public void close() throws IOException { ch.close(); }
   }
 }
