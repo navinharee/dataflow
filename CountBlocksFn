@@ -1,21 +1,18 @@
-static class CountBlocksFn extends DoFn<FileIO.ReadableFile, Long> {
+static final class CountBlocksFn extends DoFn<FileIO.ReadableFile, Long> {
   @ProcessElement
   public void process(@Element FileIO.ReadableFile f, OutputReceiver<Long> out) throws Exception {
     long total = 0L;
 
-    try (InputStream in = Channels.newInputStream(f.open());
+    try (var in = Channels.newInputStream(f.open());
          DataFileStream<GenericRecord> dfs =
              new DataFileStream<>(in, new GenericDatumReader<>())) {
 
-      // Iterate blocks until EOF; for each block, add the header’s record count.
-      while (true) {
-        try {
-          dfs.nextBlock();              // move to next block (throws EOFException at EOF)
-          total += dfs.getBlockCount(); // read header field
-        } catch (EOFException eof) {
-          break;                        // reached end of file
-        }
+      // Keep moving to next block until we hit EOF
+      while (dfs.nextBlock()) {                // ✅ public in DataFileStream
+        total += dfs.getBlockCount();          // number of records in this block
       }
+    } catch (Exception e) {
+      throw new RuntimeException("Failed scanning Avro file: " + f.getMetadata().resourceId(), e);
     }
 
     out.output(total);
