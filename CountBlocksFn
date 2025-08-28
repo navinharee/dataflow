@@ -1,12 +1,3 @@
-import java.io.EOFException;
-import java.io.InputStream;
-import java.nio.channels.Channels;
-import org.apache.avro.file.DataFileStream;
-import org.apache.avro.generic.GenericDatumReader;
-import org.apache.avro.generic.GenericRecord;
-import org.apache.beam.sdk.io.FileIO;
-import org.apache.beam.sdk.transforms.DoFn;
-
 static class CountBlocksFn extends DoFn<FileIO.ReadableFile, Long> {
   @ProcessElement
   public void process(@Element FileIO.ReadableFile f, OutputReceiver<Long> out) throws Exception {
@@ -16,14 +7,13 @@ static class CountBlocksFn extends DoFn<FileIO.ReadableFile, Long> {
          DataFileStream<GenericRecord> dfs =
              new DataFileStream<>(in, new GenericDatumReader<>())) {
 
-      // Iterate blocks until EOF; for each block, read header count and skip its data.
+      // Iterate blocks until EOF; for each block, add the header’s record count.
       while (true) {
         try {
-          dfs.nextBlock();             // position at next block (throws EOFException at end)
-          total += dfs.getBlockCount();// header field: number of records in this block
-          dfs.skipBlock();             // skip the block’s compressed bytes
+          dfs.nextBlock();              // move to next block (throws EOFException at EOF)
+          total += dfs.getBlockCount(); // read header field
         } catch (EOFException eof) {
-          break;                       // no more blocks
+          break;                        // reached end of file
         }
       }
     }
