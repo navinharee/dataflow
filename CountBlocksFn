@@ -1,15 +1,30 @@
+import java.io.InputStream;
+import java.nio.channels.Channels;
+import java.util.NoSuchElementException;
+
+import org.apache.avro.file.DataFileStream;
+import org.apache.avro.generic.GenericDatumReader;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.beam.sdk.io.FileIO;
+import org.apache.beam.sdk.transforms.DoFn;
+
 static final class CountBlocksFn extends DoFn<FileIO.ReadableFile, Long> {
   @ProcessElement
   public void process(@Element FileIO.ReadableFile f, OutputReceiver<Long> out) throws Exception {
     long total = 0L;
 
-    try (var in = Channels.newInputStream(f.open());
+    try (InputStream in = Channels.newInputStream(f.open());
          DataFileStream<GenericRecord> dfs =
              new DataFileStream<>(in, new GenericDatumReader<>())) {
 
-      // Keep moving to next block until we hit EOF
-      while (dfs.nextBlock()) {                // ✅ public in DataFileStream
-        total += dfs.getBlockCount();          // number of records in this block
+      // Advance block-by-block. nextBlock() is on DataFileStream.
+      while (true) {
+        try {
+          dfs.nextBlock();               // move to next block
+          total += dfs.getBlockCount();  // number of records in this block
+        } catch (NoSuchElementException end) {
+          break;                         // no more blocks
+        }
       }
     } catch (Exception e) {
       throw new RuntimeException("Failed scanning Avro file: " + f.getMetadata().resourceId(), e);
