@@ -1,39 +1,28 @@
-import logging
+# ---- Reusable logger (handles skipped tasks gracefully) ----
+STATE_MESSAGES = {
+    "JOB_STATE_STOPPED":   "Job created but not yet running",
+    "JOB_STATE_PENDING":   "Job is pending resource assignment",
+    "JOB_STATE_RUNNING":   "Job is currently running",
+    "JOB_STATE_DONE":      "Job finished successfully",
+    "JOB_STATE_FAILED":    "Job failed due to an error",
+    "JOB_STATE_CANCELLED": "Job was explicitly cancelled",
+    "JOB_STATE_UPDATED":   "Job graph was updated",
+    "JOB_STATE_DRAINING":  "Job is draining",
+    "JOB_STATE_DRAINED":   "Job finished draining",
+}
 
-def log_airflow_context(**kwargs):
-    """
-    Logs useful Airflow context variables from kwargs.
-    Can be reused in multiple tasks for debugging and observability.
-    Also logs Dataflow job info if present in XComs.
-    """
-    log = logging.getLogger("airflow.task")
-
-    # Basic Airflow context
-    log.info("🔹 DAG ID: %s", kwargs["dag"].dag_id)
-    log.info("🔹 Task ID: %s", kwargs["task"].task_id)
-    log.info("🔹 Run ID: %s", kwargs["dag_run"].run_id)
-    log.info("🔹 Execution Date (datetime): %s", kwargs["execution_date"])
-    log.info("🔹 DS (date string): %s", kwargs["ds"])
-    log.info("🔹 Next Execution Date: %s", kwargs.get("next_execution_date"))
-    log.info("🔹 Previous Execution Date: %s", kwargs.get("prev_execution_date"))
-    log.info("🔹 Params: %s", kwargs.get("params", {}))
-
-    # Task instance info
+def log_multiple_dataflow_jobs(upstream_task_ids: list[str], **kwargs):
     ti = kwargs["ti"]
-    log.info("🔹 Try Number: %s", ti.try_number)
-    log.info("🔹 Task State: %s", ti.state)
-
-    # Check if this task launched a Dataflow Flex Template
-    job_info = ti.xcom_pull(task_ids=ti.task_id)
-    if job_info and isinstance(job_info, dict):
-        job_id = job_info.get("job", {}).get("id")
-        project = job_info.get("job", {}).get("projectId")
-        region = job_info.get("job", {}).get("location")
-
-        if job_id:
-            log.info("🚀 Dataflow Job launched:")
-            log.info("   • Job ID: %s", job_id)
-            log.info("   • Project: %s", project)
-            log.info("   • Region: %s", region)
-            log.info("   • Console URL: https://console.cloud.google.com/dataflow/jobs/%s/%s?project=%s",
-                     region, job_id, project)
+    for tid in upstream_task_ids:
+        job_info = ti.xcom_pull(task_ids=tid)  # returns None if task skipped/failed early
+        if not isinstance(job_info, dict):
+            logging.warning("No XCom dict from %s (skipped or failed before return).", tid)
+            continue
+        job = job_info.get("job", {})
+        job_id = job.get("id"); name = job.get("name"); state = job.get("state")
+        proj = job.get("projectId"); region = job.get("location")
+        logging.info("🚀 [%s] name=%s id=%s state=%s (%s)", tid, name, job_id, state,
+                     STATE_MESSAGES.get(state, "Unknown"))
+        if job_id and proj and region:
+            logging.info("    URL: https://console.cloud.google.com/dataflow/jobs/%s/%s?project=%s",
+                         region, job_id, proj)
