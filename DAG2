@@ -1,0 +1,38 @@
+from airflow import DAG
+from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexTemplateOperator
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+from logging_utils import log_airflow_context
+
+with DAG(
+    dag_id="example_dataflow_flex_logging",
+    start_date=datetime(2025, 1, 1),
+    schedule_interval=None,
+    catchup=False,
+) as dag:
+
+    launch_dataflow = DataflowStartFlexTemplateOperator(
+        task_id="launch_dataflow_job",
+        project_id="my-gcp-project",
+        location="us-central1",
+        body={
+            "launchParameter": {
+                "jobName": "avro-total-count-{{ ds_nodash }}",
+                "containerSpecGcsPath": "gs://my-bucket/templates/avro-total-count.json",
+                "parameters": {
+                    "inputGlob": "gs://my-bucket/avro/**/*.avro",
+                    "expectedCount": "1000000000",
+                    "outputPrefix": "gs://my-bucket/metrics/summary"
+                },
+            }
+        },
+    )
+
+    log_task = PythonOperator(
+        task_id="log_context",
+        python_callable=log_airflow_context,
+        provide_context=True,
+    )
+
+    launch_dataflow >> log_task
